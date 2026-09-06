@@ -41,7 +41,9 @@ fi
 # NAO instalar o pacote `nucleotide-transformer` da InstaDeep: ele arrasta
 # JAX + haiku + scanpy e trava numpy<2 e pydantic==1.10.13. Para inferencia e
 # fine-tuning via HF bastam torch, transformers, scikit-learn e numpy.
-pip install "transformers>=4.52.4" accelerate scikit-learn numpy huggingface_hub
+# Teto <5: a transformers 5 removeu find_pruneable_heads_and_indices de
+# transformers.pytorch_utils, e o modeling_esm.py do NT importa essa funcao.
+pip install "transformers>=4.52,<5" accelerate scikit-learn numpy huggingface_hub
 
 # Diretorios que precisam existir ANTES do primeiro sbatch: o Slurm abre o
 # arquivo de --output antes de executar a primeira linha do script, e logs/

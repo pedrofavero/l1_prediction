@@ -42,7 +42,7 @@ echo "== Revision: $REVISION"
 echo "== HF_HOME:  $HF_HOME"
 
 # Duplicatas que nao servem ao PyTorch: pesos TF (*.h5) e JAX (jax_model/*).
-EXCLUDE=(--exclude "*.h5" "jax_model/*")
+EXCLUDE=(--exclude "*.h5" --exclude "jax_model/*")
 if command -v hf >/dev/null 2>&1; then
     hf download "$MODEL_ID" --revision "$REVISION" "${EXCLUDE[@]}"
 elif command -v huggingface-cli >/dev/null 2>&1; then
