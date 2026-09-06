@@ -1,0 +1,26 @@
+# Copie este arquivo para configs/paths.yaml e preencha os caminhos reais.
+# configs/paths.yaml está no .gitignore e nunca é versionado.
+#
+# Todo script do projeto deve ler caminhos daqui (ou de variável de ambiente
+# equivalente), nunca de caminho absoluto hardcoded.
+#
+# PENDÊNCIA: a área de armazenamento do cluster onde dados e outputs ficarão
+# (Home Directory, Projects, Datasets ou Storage-<usuario>) ainda não foi
+# definida. Todos os valores abaixo são placeholders.
+
+# Genoma de referência humano (hg38 / GRCh38), FASTA indexado (.fa + .fai)
+reference_genome: "/PLACEHOLDER/caminho/para/hg38.fa"
+
+# Dados de entrada brutos, produzidos fora deste repositório
+# (positivos L1 conhecidos, negativos Markov, negativos genômicos, anotações)
+raw_data_dir: "/PLACEHOLDER/caminho/para/dados_entrada"
+
+# Dados processados pelos scripts de scripts/data_prep/
+# (recortes por região, full-length, splits de treino/validação/teste)
+processed_data_dir: "/PLACEHOLDER/caminho/para/dados_processados"
+
+# Saídas de inferência, scan genômico, tabelas de predição, BEDs de candidatos
+outputs_dir: "/PLACEHOLDER/caminho/para/outputs"
+
+# Checkpoints de modelos fine-tunados
+checkpoints_dir: "/PLACEHOLDER/caminho/para/checkpoints"
