@@ -42,6 +42,22 @@ WORK_DIR="${WORK_DIR:-$HOME/l1_prediction_work}"
 SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-$WORK_DIR/toy_dataset}"
 SMOKE_REPORT_DIR="${SMOKE_REPORT_DIR:-$WORK_DIR/smoke_nt2}"
 
+# Benchmark da etapa 2 (validacao do pipeline contra numero publicado).
+# O repositorio do HF NAO declara configs (card YAML vazio; o datasets-server so
+# ve "default", que mistura as 18 tarefas): "config" aqui e o SUBDIRETORIO com
+# train.parquet/test.parquet. Revision verificada em 2026-09-15.
+NT_BENCH_DATASET_ID="${NT_BENCH_DATASET_ID:-InstaDeepAI/nucleotide_transformer_downstream_tasks}"
+NT_BENCH_CONFIG="${NT_BENCH_CONFIG:-promoter_all}"
+NT_BENCH_DATASET_REVISION="${NT_BENCH_DATASET_REVISION:-96d86d567d4cd33536e49b429dc7983121619a08}"
+NT_BENCH_DATA_DIR="${NT_BENCH_DATA_DIR:-$WORK_DIR/nt_bench/$NT_BENCH_CONFIG/data}"
+NT_BENCH_REPORT_DIR="${NT_BENCH_REPORT_DIR:-$WORK_DIR/nt_bench/$NT_BENCH_CONFIG/runs}"
+
+# Leitura dos parquet do benchmark. NAO usar o pacote `datasets` no nt2-env: ele
+# arrasta fsspec/pandas/dill/multiprocess e o fsspec interage com huggingface_hub
+# e torch. `hf download` + pyarrow bastam. Se o `datasets` for mesmo necessario
+# um dia, vai para um env separado.
+PYARROW_SPEC="${PYARROW_SPEC:-pyarrow>=14}"
+
 # Stack homologado: environments/pip_guard.sh aborta qualquer pip install que
 # mude a versao de um destes (nomes normalizados: minusculas, `-`).
 NT2_PROTECTED_PKGS="${NT2_PROTECTED_PKGS:-torch transformers tokenizers huggingface-hub numpy scikit-learn accelerate}"
@@ -49,4 +65,5 @@ NT2_PROTECTED_PKGS="${NT2_PROTECTED_PKGS:-torch transformers tokenizers huggingf
 export REPO_ROOT CONDA_SH NT2_ENV_NAME NT2_PYTHON_VERSION TORCH_INDEX_URL
 export HF_HOME NT2_MODEL_ID NT2_MODEL_REVISION
 export WORK_DIR SMOKE_DATA_DIR SMOKE_REPORT_DIR
-export NT2_PROTECTED_PKGS
+export NT_BENCH_DATASET_ID NT_BENCH_CONFIG NT_BENCH_DATASET_REVISION
+export NT_BENCH_DATA_DIR NT_BENCH_REPORT_DIR PYARROW_SPEC NT2_PROTECTED_PKGS
