@@ -37,6 +37,22 @@ source "$CONDA_SH"
 conda activate "$NT2_ENV_NAME"
 set -u
 
+# O conda activate fica (define CONDA_PREFIX etc.), mas o PATH que ele produz
+# nao e confiavel neste cluster: python e CLIs do env vem por caminho absoluto
+# ("$NT2_PYTHON", "$NT2_ENV_PREFIX/bin/...", ver config.sh).
+if [[ ! -x "$NT2_PYTHON" ]]; then
+    echo "ERRO: interpretador nao encontrado em $NT2_PYTHON" >&2
+    echo "Envs disponiveis:" >&2
+    conda env list >&2 2>/dev/null || true
+    echo "Se o env estiver em outro caminho, exporte NT2_ENV_PREFIX antes" >&2
+    exit 1
+fi
+echo "== Python: $NT2_PYTHON"
+"$NT2_PYTHON" -c "import numpy, torch, transformers" || {
+    echo "ERRO: nt2-env incompleto ou interpretador errado" >&2
+    exit 1
+}
+
 export HF_HOME
 mkdir -p "$HF_HOME"
 echo "== Dataset:  $DATASET_ID"
@@ -44,20 +60,22 @@ echo "== Config:   $CONFIG (subdiretorio)"
 echo "== Revision: $REVISION"
 echo "== HF_HOME:  $HF_HOME"
 
-if python -c "import pyarrow" 2>/dev/null; then
-    echo "== pyarrow ja instalado: $(python -c 'import pyarrow; print(pyarrow.__version__)')"
+if "$NT2_PYTHON" -c "import pyarrow" 2>/dev/null; then
+    echo "== pyarrow ja instalado: $("$NT2_PYTHON" -c 'import pyarrow; print(pyarrow.__version__)')"
 else
     pip_install_protegido "prefetch_dataset: leitura de parquet" "$PYARROW_SPEC"
 fi
 
 INCLUDE=(--include "$CONFIG/*.parquet")
-if command -v hf >/dev/null 2>&1; then
-    hf download "$DATASET_ID" --repo-type dataset --revision "$REVISION" "${INCLUDE[@]}"
-elif command -v huggingface-cli >/dev/null 2>&1; then
+# CLI do env por caminho absoluto: `command -v hf` pegaria o do base com o PATH
+# torto do cluster.
+if [ -x "$NT2_ENV_PREFIX/bin/hf" ]; then
+    "$NT2_ENV_PREFIX/bin/hf" download "$DATASET_ID" --repo-type dataset --revision "$REVISION" "${INCLUDE[@]}"
+elif [ -x "$NT2_ENV_PREFIX/bin/huggingface-cli" ]; then
     echo "AVISO: 'hf' nao encontrado; usando o alias legado huggingface-cli."
-    huggingface-cli download "$DATASET_ID" --repo-type dataset --revision "$REVISION" "${INCLUDE[@]}"
+    "$NT2_ENV_PREFIX/bin/huggingface-cli" download "$DATASET_ID" --repo-type dataset --revision "$REVISION" "${INCLUDE[@]}"
 else
-    echo "ERRO: nem 'hf' nem 'huggingface-cli' encontrados no env $NT2_ENV_NAME." >&2
+    echo "ERRO: nem 'hf' nem 'huggingface-cli' encontrados em $NT2_ENV_PREFIX/bin." >&2
     echo "      Rode environments/create_nt2_env.sh primeiro." >&2
     exit 1
 fi
@@ -69,7 +87,7 @@ fi
 
 echo
 echo "== Validando leitura OFFLINE (HF_HUB_OFFLINE=1, pyarrow) ..."
-if HF_HUB_OFFLINE=1 python - "$DATASET_ID" "$CONFIG" "$REVISION" <<'PY'
+if HF_HUB_OFFLINE=1 "$NT2_PYTHON" - "$DATASET_ID" "$CONFIG" "$REVISION" <<'PY'
 import glob
 import os
 import sys
@@ -91,7 +109,7 @@ print(f"snapshot: {snap}")
 PY
 then
     echo "== Pronto: os parquet leem sem rede. Proximo passo (login node):"
-    echo "   python $REPO_ROOT/scripts/benchmarks/nt_bench/prepare_data.py"
+    echo "   $NT2_PYTHON $REPO_ROOT/scripts/benchmarks/nt_bench/prepare_data.py"
 else
     echo "ERRO: o dataset NAO le offline. O preparo e o job vao falhar." >&2
     echo "      Confira se o HF_HOME acima e o mesmo que o job vai usar e se o" >&2

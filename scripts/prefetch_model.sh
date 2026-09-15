@@ -35,6 +35,22 @@ source "$CONDA_SH"
 conda activate "$NT2_ENV_NAME"
 set -u
 
+# O conda activate fica (define CONDA_PREFIX etc.), mas o PATH que ele produz
+# nao e confiavel neste cluster: python e CLIs do env vem por caminho absoluto
+# ("$NT2_PYTHON", "$NT2_ENV_PREFIX/bin/...", ver config.sh).
+if [[ ! -x "$NT2_PYTHON" ]]; then
+    echo "ERRO: interpretador nao encontrado em $NT2_PYTHON" >&2
+    echo "Envs disponiveis:" >&2
+    conda env list >&2 2>/dev/null || true
+    echo "Se o env estiver em outro caminho, exporte NT2_ENV_PREFIX antes" >&2
+    exit 1
+fi
+echo "== Python: $NT2_PYTHON"
+"$NT2_PYTHON" -c "import numpy, torch, transformers" || {
+    echo "ERRO: nt2-env incompleto ou interpretador errado" >&2
+    exit 1
+}
+
 export HF_HOME
 mkdir -p "$HF_HOME"
 echo "== Modelo:   $MODEL_ID"
@@ -43,13 +59,15 @@ echo "== HF_HOME:  $HF_HOME"
 
 # Duplicatas que nao servem ao PyTorch: pesos TF (*.h5) e JAX (jax_model/*).
 EXCLUDE=(--exclude "*.h5" --exclude "jax_model/*")
-if command -v hf >/dev/null 2>&1; then
-    hf download "$MODEL_ID" --revision "$REVISION" "${EXCLUDE[@]}"
-elif command -v huggingface-cli >/dev/null 2>&1; then
+# CLI do env por caminho absoluto: `command -v hf` pegaria o do base com o PATH
+# torto do cluster.
+if [ -x "$NT2_ENV_PREFIX/bin/hf" ]; then
+    "$NT2_ENV_PREFIX/bin/hf" download "$MODEL_ID" --revision "$REVISION" "${EXCLUDE[@]}"
+elif [ -x "$NT2_ENV_PREFIX/bin/huggingface-cli" ]; then
     echo "AVISO: 'hf' nao encontrado; usando o alias legado huggingface-cli."
-    huggingface-cli download "$MODEL_ID" --revision "$REVISION" "${EXCLUDE[@]}"
+    "$NT2_ENV_PREFIX/bin/huggingface-cli" download "$MODEL_ID" --revision "$REVISION" "${EXCLUDE[@]}"
 else
-    echo "ERRO: nem 'hf' nem 'huggingface-cli' encontrados no env $NT2_ENV_NAME." >&2
+    echo "ERRO: nem 'hf' nem 'huggingface-cli' encontrados em $NT2_ENV_PREFIX/bin." >&2
     echo "      Rode environments/create_nt2_env.sh primeiro." >&2
     exit 1
 fi
@@ -61,7 +79,7 @@ fi
 
 echo
 echo "== Validando carga OFFLINE (HF_HUB_OFFLINE=1, CPU) ..."
-if HF_HUB_OFFLINE=1 python - "$MODEL_ID" "$REVISION" <<'PY'
+if HF_HUB_OFFLINE=1 "$NT2_PYTHON" - "$MODEL_ID" "$REVISION" <<'PY'
 import sys
 import time
 

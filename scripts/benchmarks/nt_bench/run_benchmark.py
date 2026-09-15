@@ -83,10 +83,15 @@ def checar_ambiente(report):
     import transformers
 
     report["versoes"] = {
-        "python": platform.python_version(), "torch": torch.__version__, "torch_cuda_build": torch.version.cuda,
+        "python": platform.python_version(), "python_executable": sys.executable,
+        "nt2_python": os.environ.get("NT2_PYTHON"), "torch": torch.__version__, "torch_cuda_build": torch.version.cuda,
         "transformers": transformers.__version__, "numpy": numpy.__version__, "scikit-learn": sklearn.__version__,
     }
     print("versoes: " + ", ".join(f"{k} {v}" for k, v in report["versoes"].items()))
+    esperado = report["versoes"]["nt2_python"]
+    if esperado and os.path.realpath(esperado) != os.path.realpath(sys.executable):
+        print(f"AVISO: sys.executable ({sys.executable}) difere de NT2_PYTHON ({esperado})",
+              file=sys.stderr, flush=True)
     if not torch.cuda.is_available():
         raise Falha("torch.cuda.is_available() == False: nenhuma GPU visivel para o job. Na particao shared o "
                     "recurso e --gres=mps:<pct>, NAO --gres=gpu:; confira as diretivas #SBATCH.")

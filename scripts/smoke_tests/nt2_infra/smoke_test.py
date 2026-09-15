@@ -126,6 +126,8 @@ def etapa_ambiente(res):
 
     res.update(
         python=platform.python_version(),
+        python_executable=sys.executable,
+        nt2_python=os.environ.get("NT2_PYTHON"),
         torch=torch.__version__,
         transformers=transformers.__version__,
         numpy=numpy.__version__,
@@ -133,8 +135,11 @@ def etapa_ambiente(res):
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
         slurm_job_id=os.environ.get("SLURM_JOB_ID"),
     )
-    print(f"python {res['python']} | torch {res['torch']} (cuda {res['torch_cuda_build']}) | "
-          f"transformers {res['transformers']} | numpy {res['numpy']}")
+    print(f"python {res['python']} ({res['python_executable']}) | torch {res['torch']} "
+          f"(cuda {res['torch_cuda_build']}) | transformers {res['transformers']} | numpy {res['numpy']}")
+    if res["nt2_python"] and os.path.realpath(res["nt2_python"]) != os.path.realpath(sys.executable):
+        print(f"AVISO: sys.executable ({sys.executable}) difere de NT2_PYTHON ({res['nt2_python']})",
+              file=sys.stderr, flush=True)
 
     if not torch.cuda.is_available():
         raise FalhaEtapa(

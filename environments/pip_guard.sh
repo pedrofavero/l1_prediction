@@ -11,20 +11,26 @@
 # basta; um downgrade silencioso de fsspec ou numpy quebra o torch e parece
 # problema de modelo. Por isso toda instalacao no nt2-env passa por aqui:
 #   1. grava `pip freeze` ANTES num arquivo temporario
-#   2. roda `pip install "$@"`
+#   2. roda `"$NT2_PYTHON" -m pip install "$@"`
 #   3. grava `pip freeze` DEPOIS e compara
 #   4. aborta (return 1), com diff explicito e comando de reversao, se algum
 #      pacote de NT2_PROTECTED_PKGS que ja existia mudou de versao ou sumiu.
 #      Ausente -> presente e permitido (e assim que o env e criado).
 #   5. se algo mudou, anexa ao $WORK_DIR/env_versions.txt data, host,
-#      descricao, comando e a lista de mudancas (tambem quando aborta).
+#      interpretador, descricao, comando e a lista de mudancas (tambem quando
+#      aborta).
+#
+# Interpretador: SEMPRE "$NT2_PYTHON" (config.sh), nunca `pip`/`python` do PATH.
+# Com o PATH torto do cluster (/opt/conda/bin a frente do env), um `pip` puro
+# instalaria no base e a guarda compararia o freeze do env errado sem perceber.
 
 # Uso: pip_freeze_comparar ANTES DEPOIS
 # Imprime uma linha por pacote que mudou (+ adicionado, ~ alterado, - removido)
 # e, para protegidos que mudaram, o comando de reversao. Nada impresso = nada
 # mudou. Codigo de saida: 0 ok, 3 pacote protegido que existia mudou ou sumiu.
 pip_freeze_comparar() {
-    python - "$1" "$2" "${NT2_PROTECTED_PKGS:-}" "${TORCH_INDEX_URL:-}" <<'PY'
+    "${NT2_PYTHON:?NT2_PYTHON nao definido; carregue environments/config.sh}" - \
+        "$1" "$2" "${NT2_PROTECTED_PKGS:-}" "${TORCH_INDEX_URL:-}" <<'PY'
 import re
 import sys
 
@@ -78,10 +84,11 @@ for nome in sorted(set(antes) | set(depois)):
 if violacoes:
     print("  Para reverter os protegidos:")
     for nome, va in violacoes:
+        # sys.executable == $NT2_PYTHON: este heredoc roda sob ele.
         if va.startswith("@ "):
-            cmd = f'pip install "{nome} {va}"'
+            cmd = f'{sys.executable} -m pip install "{nome} {va}"'
         else:
-            cmd = f'pip install "{nome}=={va}"'
+            cmd = f'{sys.executable} -m pip install "{nome}=={va}"'
             if "+" in va and torch_index:  # build local (ex.: 2.11.0+cu128)
                 cmd += f" --index-url {torch_index}"
         print(f"    {cmd}")
@@ -100,8 +107,9 @@ _pip_guard_registrar() {
         echo
         echo "# ---- pip_install_protegido: $situacao em $(date -Iseconds) em $(hostname) ----"
         echo "env: ${CONDA_DEFAULT_ENV:-?}"
+        echo "interpretador: $NT2_PYTHON"
         echo "descricao: $descricao"
-        echo "comando: pip install $(printf '%q ' "$@")"
+        echo "comando: $NT2_PYTHON -m pip install $(printf '%q ' "$@")"
         echo "$mudancas"
     } >> "$arquivo"
     echo "== Mudanca registrada em $arquivo"
@@ -116,15 +124,21 @@ pip_install_protegido() {
         echo "      esperado '${NT2_ENV_NAME:-?}'. Ative o env antes de instalar." >&2
         return 1
     fi
+    if [ -z "${NT2_PYTHON:-}" ] || [ ! -x "$NT2_PYTHON" ]; then
+        echo "ERRO: pip_install_protegido: interpretador '${NT2_PYTHON:-}' nao existe ou nao e" >&2
+        echo "      executavel. Carregue environments/config.sh (ou exporte NT2_ENV_PREFIX)." >&2
+        return 1
+    fi
+    echo "== Interpretador: $NT2_PYTHON"
 
     local antes depois mudancas
     local rc_pip=0 rc_cmp=0
     antes="$(mktemp)"
     depois="$(mktemp)"
-    python -m pip freeze > "$antes"
-    echo "== pip install $* ($descricao)"
-    python -m pip install "$@" || rc_pip=$?
-    python -m pip freeze > "$depois"
+    "$NT2_PYTHON" -m pip freeze > "$antes"
+    echo "== $NT2_PYTHON -m pip install $* ($descricao)"
+    "$NT2_PYTHON" -m pip install "$@" || rc_pip=$?
+    "$NT2_PYTHON" -m pip freeze > "$depois"
     mudancas="$(pip_freeze_comparar "$antes" "$depois")" || rc_cmp=$?
     rm -f "$antes" "$depois"
 
@@ -145,7 +159,7 @@ pip_install_protegido() {
 # ERRO: o pip install acima MUDOU pacote(s) protegido(s) do env homologado
 # ($NT2_ENV_NAME). O env pode nao ser mais o que passou no smoke test.
 # Reverta com os comandos listados acima e confira com:
-#     python -m pip freeze | grep -iE '$(echo "${NT2_PROTECTED_PKGS:-}" | tr ' ' '|')'
+#     $NT2_PYTHON -m pip freeze | grep -iE '$(echo "${NT2_PROTECTED_PKGS:-}" | tr ' ' '|')'
 # Protegidos: ${NT2_PROTECTED_PKGS:-}
 ############################################################################
 

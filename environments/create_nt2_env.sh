@@ -27,13 +27,27 @@ fi
 conda activate "$NT2_ENV_NAME"
 set -u
 
+# O conda activate fica (define CONDA_PREFIX, que a guarda de pip confere), mas
+# o PATH que ele produz nao e confiavel neste cluster: todo python/pip roda por
+# "$NT2_PYTHON" (config.sh). Sem import check aqui: num env recem-criado o
+# torch ainda nao existe.
+if [[ ! -x "$NT2_PYTHON" ]]; then
+    echo "ERRO: interpretador nao encontrado em $NT2_PYTHON" >&2
+    echo "      (o conda ativou CONDA_PREFIX=${CONDA_PREFIX:-?})" >&2
+    echo "Envs disponiveis:" >&2
+    conda env list >&2 2>/dev/null || true
+    echo "Se o env estiver em outro caminho, exporte NT2_ENV_PREFIX antes" >&2
+    exit 1
+fi
+echo "== Python: $NT2_PYTHON"
+
 # Todo pip install passa por environments/pip_guard.sh: freeze antes/depois,
 # aborta se um pacote de NT2_PROTECTED_PKGS que ja existia mudar de versao e
 # registra a mudanca em $WORK_DIR/env_versions.txt.
 
 # PyTorch com CUDA 12.8 (wheel oficial). So instala se ainda nao importa.
-if python -c "import torch" 2>/dev/null; then
-    echo "torch ja instalado: $(python -c 'import torch; print(torch.__version__)')"
+if "$NT2_PYTHON" -c "import torch" 2>/dev/null; then
+    echo "torch ja instalado: $("$NT2_PYTHON" -c 'import torch; print(torch.__version__)')"
 else
     pip_install_protegido "create_nt2_env: torch cu128" torch --index-url "$TORCH_INDEX_URL"
 fi
@@ -86,11 +100,12 @@ echo "== Versoes instaladas"
     echo
     echo "# ==== snapshot do env gerado em $(date -Iseconds) em $(hostname) ===="
     echo "env: $NT2_ENV_NAME"
-    python - <<'PY'
+    "$NT2_PYTHON" - <<'PY'
 import importlib
 import sys
 
 print(f"python {sys.version.split()[0]}")
+print(f"sys.executable {sys.executable}")
 for mod in ("torch", "transformers", "accelerate", "sklearn", "numpy", "huggingface_hub"):
     try:
         m = importlib.import_module(mod)
@@ -108,7 +123,7 @@ PY
 {
     echo
     echo "# ---- pip freeze ----"
-    pip freeze
+    "$NT2_PYTHON" -m pip freeze
 } >> "$VERSIONS_FILE"
 echo
 echo "Versoes anexadas a $VERSIONS_FILE (inclui pip freeze)."

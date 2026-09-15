@@ -22,6 +22,15 @@ NT2_ENV_NAME="${NT2_ENV_NAME:-nt2-env}"
 NT2_PYTHON_VERSION="${NT2_PYTHON_VERSION:-3.10}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 
+# Interpretador do env por caminho ABSOLUTO. Nunca confiar no `python`/`pip` do
+# PATH: no no de compute do CISIA o PATH pode ficar com /opt/conda/bin a frente
+# do env mesmo depois de `conda activate`, que retorna 0 assim mesmo. `python`
+# roda entao o base (sem numpy/torch) e a falha e silenciosa ate o primeiro
+# import (job 2108). Todo script chama "$NT2_PYTHON" e "$NT2_PYTHON" -m pip.
+: "${HOME:?HOME nao definido — impossivel derivar NT2_ENV_PREFIX}"
+NT2_ENV_PREFIX="${NT2_ENV_PREFIX:-$HOME/.conda/envs/$NT2_ENV_NAME}"
+NT2_PYTHON="${NT2_PYTHON:-$NT2_ENV_PREFIX/bin/python}"
+
 # Cache do Hugging Face. Os modelos sao baixados no login node (com rede) e
 # lidos offline pelos jobs (HF_HUB_OFFLINE=1), entao o mesmo HF_HOME precisa
 # estar visivel nos nos de compute.
@@ -63,6 +72,7 @@ PYARROW_SPEC="${PYARROW_SPEC:-pyarrow>=14}"
 NT2_PROTECTED_PKGS="${NT2_PROTECTED_PKGS:-torch transformers tokenizers huggingface-hub numpy scikit-learn accelerate}"
 
 export REPO_ROOT CONDA_SH NT2_ENV_NAME NT2_PYTHON_VERSION TORCH_INDEX_URL
+export NT2_ENV_PREFIX NT2_PYTHON
 export HF_HOME NT2_MODEL_ID NT2_MODEL_REVISION
 export WORK_DIR SMOKE_DATA_DIR SMOKE_REPORT_DIR
 export NT_BENCH_DATASET_ID NT_BENCH_CONFIG NT_BENCH_DATASET_REVISION
