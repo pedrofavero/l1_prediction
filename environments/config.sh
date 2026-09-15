@@ -42,6 +42,11 @@ WORK_DIR="${WORK_DIR:-$HOME/l1_prediction_work}"
 SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-$WORK_DIR/toy_dataset}"
 SMOKE_REPORT_DIR="${SMOKE_REPORT_DIR:-$WORK_DIR/smoke_nt2}"
 
+# Stack homologado: environments/pip_guard.sh aborta qualquer pip install que
+# mude a versao de um destes (nomes normalizados: minusculas, `-`).
+NT2_PROTECTED_PKGS="${NT2_PROTECTED_PKGS:-torch transformers tokenizers huggingface-hub numpy scikit-learn accelerate}"
+
 export REPO_ROOT CONDA_SH NT2_ENV_NAME NT2_PYTHON_VERSION TORCH_INDEX_URL
 export HF_HOME NT2_MODEL_ID NT2_MODEL_REVISION
 export WORK_DIR SMOKE_DATA_DIR SMOKE_REPORT_DIR
+export NT2_PROTECTED_PKGS

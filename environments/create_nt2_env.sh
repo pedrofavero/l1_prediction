@@ -10,6 +10,7 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || (cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd))"
 source "$REPO_ROOT/environments/config.sh"
+source "$REPO_ROOT/environments/pip_guard.sh"
 
 echo "== Ambiente: $NT2_ENV_NAME (python $NT2_PYTHON_VERSION)"
 echo "== REPO_ROOT=$REPO_ROOT"
@@ -26,11 +27,15 @@ fi
 conda activate "$NT2_ENV_NAME"
 set -u
 
+# Todo pip install passa por environments/pip_guard.sh: freeze antes/depois,
+# aborta se um pacote de NT2_PROTECTED_PKGS que ja existia mudar de versao e
+# registra a mudanca em $WORK_DIR/env_versions.txt.
+
 # PyTorch com CUDA 12.8 (wheel oficial). So instala se ainda nao importa.
 if python -c "import torch" 2>/dev/null; then
     echo "torch ja instalado: $(python -c 'import torch; print(torch.__version__)')"
 else
-    pip install torch --index-url "$TORCH_INDEX_URL"
+    pip_install_protegido "create_nt2_env: torch cu128" torch --index-url "$TORCH_INDEX_URL"
 fi
 
 # Stack para inferencia e fine-tuning via Hugging Face.
@@ -43,7 +48,8 @@ fi
 # fine-tuning via HF bastam torch, transformers, scikit-learn e numpy.
 # Teto <5: a transformers 5 removeu find_pruneable_heads_and_indices de
 # transformers.pytorch_utils, e o modeling_esm.py do NT importa essa funcao.
-pip install "transformers>=4.52,<5" accelerate scikit-learn numpy huggingface_hub
+pip_install_protegido "create_nt2_env: stack HF" \
+    "transformers>=4.52,<5" accelerate scikit-learn numpy huggingface_hub
 
 # Diretorios que precisam existir ANTES do primeiro sbatch: o Slurm abre o
 # arquivo de --output antes de executar a primeira linha do script, e logs/
@@ -72,11 +78,13 @@ if [ "${FREE_KB:-0}" -lt "$MIN_KB" ]; then
 EOF
 fi
 
-# Versoes efetivamente instaladas: na tela e em $WORK_DIR/env_versions.txt
+# Versoes efetivamente instaladas: na tela e ANEXADAS a $WORK_DIR/env_versions.txt
+# (append: o arquivo guarda tambem o historico de mudancas da guarda de pip).
 VERSIONS_FILE="$WORK_DIR/env_versions.txt"
 echo "== Versoes instaladas"
 {
-    echo "# gerado em $(date -Iseconds) em $(hostname)"
+    echo
+    echo "# ==== snapshot do env gerado em $(date -Iseconds) em $(hostname) ===="
     echo "env: $NT2_ENV_NAME"
     python - <<'PY'
 import importlib
@@ -96,12 +104,12 @@ try:
 except Exception:  # noqa: BLE001
     pass
 PY
-} | tee "$VERSIONS_FILE"
+} | tee -a "$VERSIONS_FILE"
 {
     echo
     echo "# ---- pip freeze ----"
     pip freeze
 } >> "$VERSIONS_FILE"
 echo
-echo "Versoes gravadas em $VERSIONS_FILE (inclui pip freeze)."
+echo "Versoes anexadas a $VERSIONS_FILE (inclui pip freeze)."
 echo "Proximo passo: scripts/prefetch_model.sh"
