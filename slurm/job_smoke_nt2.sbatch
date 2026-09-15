@@ -39,6 +39,7 @@ set -u
 export HF_HOME
 export HF_HUB_OFFLINE=1          # o no de compute nao tem rede; tudo vem do cache
 export TOKENIZERS_PARALLELISM=false
+export PYTHONPATH="$REPO_ROOT/scripts:${PYTHONPATH:-}"   # lib/nt2_train.py
 export NT2_MODEL_ID NT2_MODEL_REVISION SMOKE_DATA_DIR SMOKE_REPORT_DIR
 
 nvidia-smi || echo "AVISO: nvidia-smi indisponivel neste no"

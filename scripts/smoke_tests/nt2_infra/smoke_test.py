@@ -18,12 +18,15 @@ Imports pesados (torch, transformers, numpy, sklearn) ficam DENTRO das funcoes d
 etapa, para que --help funcione sem GPU e para que um erro de import apareca
 como FAIL da etapa, nao como crash antes do relatorio.
 
+O loop de fine-tuning vem de scripts/lib/nt2_train.py (compartilhado com o
+benchmark e o treino de L1). Requer PYTHONPATH="$REPO_ROOT/scripts" (o .sbatch
+exporta).
+
 Caminhos vem de variaveis de ambiente exportadas pelo sbatch (NT2_MODEL_ID,
 NT2_MODEL_REVISION, SMOKE_DATA_DIR, SMOKE_REPORT_DIR), com override por CLI.
 Grava <report-dir>/smoke_report.json ao final, sempre, mesmo em falha.
 """
 import argparse
-import csv
 import json
 import os
 import random
@@ -31,6 +34,17 @@ import socket
 import sys
 import time
 import traceback
+
+try:
+    from lib.nt2_train import (MAX_LEN_TOKENS, carregar_classificador, carregar_csv, codificar, fixar_seed,
+                               metricas, pico_vram, predizer, treinar)
+except ModuleNotFoundError as e:
+    if e.name not in ("lib", "lib.nt2_train"):
+        raise
+    sys.exit('ERRO: modulo lib.nt2_train nao encontrado (PYTHONPATH sem <repo>/scripts). Os .sbatch ja\n'
+             'exportam; em uso interativo, antes de rodar:\n'
+             '    export PYTHONPATH="$REPO_ROOT/scripts:${PYTHONPATH:-}"\n'
+             '(REPO_ROOT = raiz do repositorio; `source environments/config.sh` a define)')
 
 MODEL_ID_DEFAULT = "InstaDeepAI/nucleotide-transformer-v2-50m-multi-species"
 REVISION_DEFAULT = "81b29e5786726d891dbf929404ef20adca5b36f1"
@@ -40,7 +54,6 @@ ESPECIAIS = {"<unk>": 0, "<pad>": 1, "<mask>": 2, "<cls>": 3, "<eos>": 4, "<bos>
 VOCAB_ESPERADO = 4107
 HIDDEN_ESPERADO = 512
 N_CAMADAS_ESPERADO = 12
-MAX_LEN_TOKENS = 2048
 LIMIAR_ACC = 0.85
 
 CTX = {}  # objetos compartilhados entre etapas: device, tokenizer, modelos, medicoes
@@ -99,16 +112,6 @@ def etapa(rel, nome, fn, critica=True):
     if status == "FAIL":
         rel.falha_critica = True
     rel.registrar(nome, status, detalhe, **res)
-
-
-def fixar_seed(seed):
-    import numpy as np
-    import torch
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 # ---------------------------------------------------------------------------
@@ -317,22 +320,11 @@ def etapa_forward(res):
 # ---------------------------------------------------------------------------
 # 5. fine_tuning
 # ---------------------------------------------------------------------------
-def ler_csv(path):
-    seqs, labels = [], []
-    with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            seqs.append(row["sequence"].strip().upper())  # .upper(): FASTA soft-masked
-            labels.append(int(row["label"]))
-    return seqs, labels
-
-
 def etapa_fine_tuning(res, args):
     import math
 
     import numpy as np
     import torch
-    from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
-    from transformers import AutoModelForSequenceClassification
 
     if not args.data_dir:
         raise FalhaEtapa("informe --data-dir ou exporte SMOKE_DATA_DIR (gerado por make_toy_dataset.py)")
@@ -341,7 +333,7 @@ def etapa_fine_tuning(res, args):
         path = os.path.join(args.data_dir, f"{nome}.csv")
         if not os.path.exists(path):
             raise FalhaEtapa(f"{path} nao existe; rode make_toy_dataset.py --out-dir {args.data_dir}")
-        splits[nome] = ler_csv(path)
+        splits[nome] = carregar_csv(path)
     for nome, (s, y) in splits.items():
         if not set(y) <= {0, 1}:
             raise FalhaEtapa(f"rotulos de {nome} fora de {{0,1}}: {sorted(set(y))[:10]}")
@@ -357,82 +349,53 @@ def etapa_fine_tuning(res, args):
         del CTX["model_mlm"]
         torch.cuda.empty_cache()
 
-    # Cabeca de classificacao nativa (pooling CLS). Sem gradient checkpointing:
-    # o modeling vendorizado tem supports_gradient_checkpointing = False.
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_id, revision=args.revision, trust_remote_code=True, num_labels=2
-    ).to(dev)
-
-    def encode(batch_seqs):
-        enc = tok(batch_seqs, padding="longest", truncation=True, max_length=MAX_LEN_TOKENS, return_tensors="pt")
-        return {k: v.to(dev) for k, v in enc.items()}
-
-    @torch.no_grad()
-    def predizer(seqs, bs=64):
-        model.eval()
-        preds = []
-        for i in range(0, len(seqs), bs):
-            logits = model(**encode(seqs[i:i + bs])).logits
-            preds.extend(logits.argmax(-1).tolist())
-        return preds
+    # Cabeca de classificacao nativa (pooling CLS), sem gradient checkpointing
+    model = carregar_classificador(args.model_id, args.revision, num_labels=2, device=dev)
 
     train_s, train_y = splits["train"]
     dev_s, dev_y = splits["dev"]
     test_s, test_y = splits["test"]
     bs = args.batch_size
     passos_epoca = math.ceil(len(train_s) / bs)
-    total_passos = passos_epoca * args.epochs
-
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=total_passos, pct_start=0.1)
     print(f"treino: {args.epochs} epocas x {passos_epoca} passos, batch {bs}, lr max {args.lr}, "
           f"AdamW + OneCycleLR + clip 1.0, device {next(model.parameters()).device}")
 
     torch.cuda.reset_peak_memory_stats()
-    perdas, accs_dev = [], []
-    n_treinadas = 0
+    accs_dev = []
     t_treino = time.perf_counter()
-    for ep in range(args.epochs):
-        model.train()
-        idx = list(range(len(train_s)))
-        random.shuffle(idx)
-        soma, n_batches = 0.0, 0
-        for i in range(0, len(idx), bs):
-            lote = idx[i:i + bs]
-            enc = encode([train_s[j] for j in lote])
-            y = torch.tensor([train_y[j] for j in lote], device=dev)
-            out = model(**enc, labels=y)
-            out.loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            sched.step()
-            opt.zero_grad(set_to_none=True)
-            soma += out.loss.item()
-            n_batches += 1
-            n_treinadas += len(lote)
-        perdas.append(round(soma / n_batches, 4))
-        acc_dev = accuracy_score(dev_y, predizer(dev_s))
+    # A tokenizacao fica dentro da janela de tempo do treino (e a do test na de
+    # inferencia), como antes da extracao do loop: throughputs comparaveis.
+    train_ids, train_mask = codificar(tok, train_s, MAX_LEN_TOKENS)
+    dev_ids, dev_mask = codificar(tok, dev_s, MAX_LEN_TOKENS)
+
+    def ao_fim_da_epoca(ep, loss, lr_atual):
+        acc_dev = metricas(dev_y, predizer(model, dev_ids, dev_mask, 64)[0])["accuracy"]
         accs_dev.append(round(acc_dev, 4))
-        print(f"epoca {ep + 1}/{args.epochs}: loss {perdas[-1]:.4f}, acc dev {acc_dev:.3f}, "
-              f"lr {sched.get_last_lr()[0]:.2e}", flush=True)
+        print(f"epoca {ep}/{args.epochs}: loss {round(loss, 4):.4f}, acc dev {acc_dev:.3f}, "
+              f"lr {lr_atual:.2e}", flush=True)
+
+    perdas = treinar(model, train_ids, train_mask, train_y, args.epochs, bs, args.lr,
+                     weight_decay=0.01, seed=args.seed, ao_fim_da_epoca=ao_fim_da_epoca)
+    perdas = [round(p, 4) for p in perdas]
+    n_treinadas = len(train_s) * args.epochs
     torch.cuda.synchronize()
     tempo_treino = time.perf_counter() - t_treino
 
     t_inf = time.perf_counter()
-    pred_test = predizer(test_s)
+    test_ids, test_mask = codificar(tok, test_s, MAX_LEN_TOKENS)
+    pred_test, _ = predizer(model, test_ids, test_mask, 64)
     torch.cuda.synchronize()
     tempo_inf = time.perf_counter() - t_inf
 
-    acc = accuracy_score(test_y, pred_test)
-    f1 = f1_score(test_y, pred_test, average="macro")
-    mcc = matthews_corrcoef(test_y, pred_test)
+    m = metricas(test_y, pred_test)
+    acc, f1, mcc = m["accuracy"], m["f1_macro"], m["mcc"]
     res.update(
         epochs=args.epochs, batch_size=bs, lr=args.lr, loss_por_epoca=perdas, acc_dev_por_epoca=accs_dev,
         test_accuracy=round(float(acc), 4), test_f1_macro=round(float(f1), 4), test_mcc=round(float(mcc), 4),
         limiar_accuracy=LIMIAR_ACC, tempo_treino_s=round(tempo_treino, 1),
         throughput_treino_seq_s=round(n_treinadas / tempo_treino, 1),
         throughput_inferencia_seq_s=round(len(test_s) / tempo_inf, 1),
-        vram_pico_treino_gb=round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        vram_pico_treino_gb=round(pico_vram()[0], 2),
         pred_test_distribuicao={"0": int(np.sum(np.array(pred_test) == 0)), "1": int(np.sum(np.array(pred_test) == 1))},
     )
     CTX["throughput"] = {"treino_seq_s": res["throughput_treino_seq_s"],
@@ -443,7 +406,7 @@ def etapa_fine_tuning(res, args):
     if acc < LIMIAR_ACC:
         diag = [
             f"1. .upper() aplicado? {'sim' if all(s == s.upper() for s in train_s[:50]) else 'NAO'} "
-            "(ler_csv aplica; confira o CSV se veio de outro lugar)",
+            "(carregar_csv aplica; confira o CSV se veio de outro lugar)",
             f"2. rotulos inteiros 0/1 e balanceados? {contagem}",
             f"3. lr sensato? lr max {args.lr} (referencia: 1e-4 para o 50m); predicoes no teste: "
             f"{res['pred_test_distribuicao']} (tudo numa classe = nao aprendeu)",
@@ -462,10 +425,7 @@ def etapa_recursos(res):
     import math
     import resource
 
-    import torch
-
-    pico = torch.cuda.max_memory_allocated() / 2**30
-    reservado = torch.cuda.max_memory_reserved() / 2**30
+    pico, reservado = pico_vram()
     rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB no Linux
     rss_gb = rss_kb / 2**20
     res.update(vram_pico_alocada_gb=round(pico, 2), vram_pico_reservada_gb=round(reservado, 2),
