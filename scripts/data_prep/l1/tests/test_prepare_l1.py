@@ -49,8 +49,12 @@ def linha_rmsk(chrom, s, e, strand, nome, classe, familia):
     return "\t".join(map(str, (0, 0, 0, 0, 0, chrom, s, e, 0, strand, nome, classe, familia, 0, 0, 0, 1))) + "\n"
 
 
-def janela(wid, source, label, chrom="", holdout=False, uniao=()):
-    return P.nova_janela(wid, source, label, "A" * W, chrom=chrom, holdout=holdout, uniao=list(uniao))
+def janela(wid, source, label, chrom="", holdout=False, uniao=(), dev_chrom=False):
+    return P.nova_janela(wid, source, label, "A" * W, chrom=chrom, holdout=holdout, uniao=list(uniao),
+                         dev_chrom=dev_chrom)
+
+
+FR = [0.8, 0.1, 0.1]
 
 
 class TestBasicos(unittest.TestCase):
@@ -70,6 +74,20 @@ class TestBasicos(unittest.TestCase):
         self.assertEqual(P.bin_gc(0, W), 0)
         self.assertEqual(P.bin_gc(W, W), P.N_BINS_GC - 1)
         self.assertEqual(P.bin_gc(512, 1024), 25)
+
+    def test_faixa_id(self):
+        self.assertEqual([P.faixa_id(x) for x in (0, 0.7999, 0.80, 0.8999, 0.90, 0.9499, 0.95, 1.0)],
+                         ["<0.80", "<0.80", "0.80-0.90", "0.80-0.90", "0.90-0.95", "0.90-0.95", ">=0.95", ">=0.95"])
+
+    def test_maximos_por_consulta(self):
+        linhas = ["q0\tt1\t0.990\t300\t0.29\t0.29\n",    # local, sem cobertura
+                  "q0\tt2\t0.930\t1000\t0.98\t0.98\n",   # cobertura
+                  "q0\tt3\t0.910\t1024\t1.00\t1.00\n",
+                  "q1\tt1\t0.999\t150\t0.19\t0.19\n"]    # curto demais e sem cobertura
+        m = P.maximos_por_consulta(linhas)
+        self.assertEqual(m["q0"], [0.93, 0.99])
+        self.assertEqual(m["q1"], [0.0, 0.0])
+        self.assertNotIn("q2", m)  # sem hit -> identidade_com_train usa 0
 
     def test_starts_janela(self):
         self.assertEqual(P.starts_janela(1000, 1300, W, 512), [1150 - 512])         # centrada
@@ -189,7 +207,7 @@ class TestSplit(unittest.TestCase):
 
     def test_filter_test(self):
         js, g = self._janelas()
-        split, strict, purg = P.atribuir_splits(js, g, 42, 0.1, [0.8, 0.1, 0.1], [0.8, 0.1, 0.1], "filter-test")
+        split, strict, _, purg = P.atribuir_splits(js, g, 42, "hash", 0.1, FR, FR, "filter-test")
         self.assertEqual(purg, [])
         self.assertEqual(len(split), len(js))                       # train/dev intactos
         self.assertEqual(split["l1:chr21:0-1024"], "test")
@@ -201,7 +219,7 @@ class TestSplit(unittest.TestCase):
 
     def test_purge_train(self):
         js, g = self._janelas()
-        split, strict, purg = P.atribuir_splits(js, g, 42, 0.1, [0.8, 0.1, 0.1], [0.8, 0.1, 0.1], "purge-train")
+        split, strict, _, purg = P.atribuir_splits(js, g, 42, "hash", 0.1, FR, FR, "purge-train")
         self.assertEqual([j["wid"] for j in purg], ["l1:chr1:0-1024"])
         self.assertNotIn("l1:chr1:0-1024", split)
         self.assertEqual(strict, {w for w, s in split.items() if s == "test"})
@@ -211,12 +229,47 @@ class TestSplit(unittest.TestCase):
         js = [janela(f"l1:chr1:{i}-{i + W}", "l1", 1, "chr1", False, [f"elem:{i // 7}"]) for i in range(400)]
         pares = [(rng.randrange(400), rng.randrange(400)) for _ in range(60)]
         g = P.agrupar(js, pares)
-        split, _, _ = P.atribuir_splits(js, g, 42, 0.3, [0.8, 0.1, 0.1], [0.8, 0.1, 0.1], "filter-test")
+        split, _, dev_strict, _ = P.atribuir_splits(js, g, 42, "hash", 0.3, FR, FR, "filter-test")
         por_grupo = defaultdict(set)
         for wid, s in split.items():
             por_grupo[g[wid]].add(s)
         self.assertTrue(all(len(s) == 1 for s in por_grupo.values()))
         self.assertEqual(set(split.values()), {"train", "dev"})
+        self.assertEqual(dev_strict, {w for w, s in split.items() if s == "dev"})  # hash: dev_strict == dev
+
+    def test_dev_por_cromossomo(self):
+        js = [janela("l1:chr21:0-1024", "l1", 1, "chr21", True, ["elem:A"]),
+              janela("l1:chr10:0-1024", "l1", 1, "chr10", False, ["elem:B"], dev_chrom=True),
+              janela("l1:chr1:0-1024", "l1", 1, "chr1", False, ["elem:C"]),        # mesmo grupo dos 2 acima
+              janela("l1:chr10:5000-6024", "l1", 1, "chr10", False, ["elem:D"], dev_chrom=True),  # sozinho
+              janela("l1:chr10:9000-10024", "l1", 1, "chr10", False, ["elem:E"], dev_chrom=True),
+              janela("l1:chr21:9000-10024", "l1", 1, "chr21", True, ["elem:F"]),   # grupo so com dev
+              janela("retrovirus:NC_1.1:0", "retrovirus", 1, uniao=["acc:NC_1.1"]),
+              janela("markov:0000001", "markov", 0)]
+        g = P.agrupar(js, [(0, 1), (1, 2), (4, 5), (7, 3)])  # markov no grupo de um dev
+        split, test_strict, dev_strict, purg = P.atribuir_splits(js, g, 42, "chrom", 0.1, FR, FR, "filter-test")
+        self.assertEqual(purg, [])
+        self.assertEqual(len(split), len(js))  # train intacto, nada removido
+        self.assertEqual([split[w] for w in ("l1:chr21:0-1024", "l1:chr10:0-1024", "l1:chr1:0-1024")],
+                         ["test", "dev", "train"])
+        self.assertEqual(split["markov:0000001"], "dev")            # segue a genomica do grupo
+        self.assertEqual(split["retrovirus:NC_1.1:0"], P.por_fracoes(P.fracao_hash(42, g["retrovirus:NC_1.1:0"]), FR))
+        self.assertEqual(dev_strict, {"l1:chr10:5000-6024", "l1:chr10:9000-10024", "markov:0000001"})
+        self.assertNotIn("l1:chr21:9000-10024", test_strict)        # grupo com dev
+        self.assertNotIn("l1:chr21:0-1024", test_strict)
+
+    def test_dev_e_holdout_disjuntos(self):
+        with tempfile.TemporaryDirectory() as d:
+            vazios = []
+            for nome in ("g.fa", "r.gz", "l.tsv", "v.fa", "c.fa"):
+                open(os.path.join(d, nome), "w").close()
+                vazios.append(os.path.join(d, nome))
+            argv = ["--out-dir", d, "--hg38", vazios[0], "--rmsk", vazios[1], "--l1farm", vazios[2],
+                    "--retro-genomes", vazios[3], "--retro-cds", vazios[4], "--mmseqs", "x", "--tmp-dir", d,
+                    "--dev-chroms", "chr7,chr21"]
+            with self.assertRaises(SystemExit) as ctx:
+                P.main(argv)
+            self.assertIn("disjuntos", str(ctx.exception.code))
 
     def test_balancear_completa_com_background(self):
         mix = {"markov": 0.35, "te": 0.35, "background": 0.30}
@@ -253,7 +306,7 @@ class TestMarkov(unittest.TestCase):
 
 @unittest.skipUnless(os.access(MMSEQS, os.X_OK), f"MMseqs2 nao encontrado em {MMSEQS}")
 class TestPontaAPonta(unittest.TestCase):
-    """Genoma sintetico chr21 (holdout) + chr22, com um L1 copiado entre os dois (vazamento)."""
+    """Genoma sintetico chr21 (holdout), chr10 (dev) e chr22 (train), com um L1 copiado entre os tres."""
 
     @classmethod
     def setUpClass(cls):
@@ -264,6 +317,7 @@ class TestPontaAPonta(unittest.TestCase):
         rng = random.Random(11)
         chr21, chr22 = list(seq_aleatoria(120000, rng)), list(seq_aleatoria(200000, rng))
         familia, unico21, unico22 = (seq_aleatoria(6000, rng, 0.40) for _ in range(3))
+        chr10, unico10 = list(seq_aleatoria(120000, rng)), seq_aleatoria(6000, rng, 0.40)
         l1farm, rmsk = [], []
 
         def inserir(nome, crom, pos, molde, strand, ident):
@@ -277,16 +331,20 @@ class TestPontaAPonta(unittest.TestCase):
         inserir("chr22", chr22, 10000, mutar(familia, 0.02, rng), "+", 0.99)
         inserir("chr22", chr22, 60000, mutar(familia, 0.02, rng), "+", 0.99)
         inserir("chr22", chr22, 120000, unico22, "+", 0.96)
+        inserir("chr10", chr10, 10000, mutar(familia, 0.02, rng), "-", 0.99)
+        inserir("chr10", chr10, 50000, unico10, "+", 0.98)
         rmsk.append(linha_rmsk("chr22", 150000, 151000, "+", "L1MA9", "LINE", "L1"))  # L1 antigo
         rmsk.append(linha_rmsk("chr22", 130000, 131000, "+", "MER41", "LTR", "ERV1"))
-        for crom, nome, ini, fim in (("chr21", "chr21", 70000, 115000), ("chr22", "chr22", 70000, 115000)):
+        for crom, nome, ini, fim in (("chr21", "chr21", 70000, 115000), ("chr22", "chr22", 70000, 115000),
+                                     ("chr10", "chr10", 70000, 115000)):
             for i, pos in enumerate(range(ini, fim, 2500)):
                 classe, fam = (("SINE", "Alu"), ("SINE", "MIR"), ("DNA", "TcMar-Tigger"), ("LINE", "L2"))[i % 4]
                 rmsk.append(linha_rmsk(nome, pos, pos + 300, "+-"[i % 2], fam + "x", classe, fam))
         rmsk.append(linha_rmsk("chr22", 160000, 160050, "+", "(CA)n", "Simple_repeat", "Simple_repeat"))
         s21, s22 = "".join(chr21), "".join(chr22)
         cls.hg38 = os.path.join(d, "hg38.fa")
-        escrever_fasta(cls.hg38, [("chr21", s21[:30000].lower() + s21[30000:]), ("chr22", s22),
+        escrever_fasta(cls.hg38, [("chr10", "".join(chr10)), ("chr21", s21[:30000].lower() + s21[30000:]),
+                                  ("chr22", s22),
                                   ("chr22_KI270731v1_random", seq_aleatoria(5000, rng))])
         pysam.faidx(cls.hg38)
         cls.rmsk = os.path.join(d, "rmsk.txt.gz")
@@ -311,7 +369,7 @@ class TestPontaAPonta(unittest.TestCase):
     def rodar(self, out, *extra):
         argv = ["--out-dir", out, "--hg38", self.hg38, "--rmsk", self.rmsk, "--l1farm", self.l1farm,
                 "--retro-genomes", self.retro, "--retro-cds", self.cds, "--mmseqs", MMSEQS,
-                "--tmp-dir", os.path.join(self.d, "tmp"), "--threads", "1", "--limit-chroms", "chr21,chr22",
+                "--tmp-dir", os.path.join(self.d, "tmp"), "--threads", "1", "--limit-chroms", "chr10,chr21,chr22",
                 *extra]
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -341,16 +399,20 @@ class TestPontaAPonta(unittest.TestCase):
         with open(os.path.join(out1, "data_meta.json")) as f:
             meta = json.load(f)
         grupos = {n: {r["group"] for r in rs} for n, rs in linhas.items()}
-        self.assertFalse(grupos["train"] & grupos["dev"])
+        self.assertTrue(grupos["train"] & grupos["dev"])               # esperado no modo chrom (filter-test)
+        self.assertFalse(grupos["dev_strict"] & grupos["train"])
         self.assertFalse(grupos["test_strict"] & (grupos["train"] | grupos["dev"]))
         for nome, rs in linhas.items():
             self.assertTrue(all(len(r["sequence"]) == W and P.so_acgt(r["sequence"]) for r in rs))
             self.assertTrue(all(r["label"] in ("0", "1") for r in rs))
             chroms = {r["chrom"] for r in rs if r["chrom"]}
-            if nome in ("test", "test_strict"):
-                self.assertEqual(chroms, {"chr21"})
+            self.assertEqual(chroms, {"chr21"} if nome.startswith("test") else
+                             {"chr10"} if nome.startswith("dev") else {"chr22"}, nome)
+            ids = [r["max_id_train"] for r in rs] + [r["max_id_train_local"] for r in rs]
+            if nome == "train":
+                self.assertEqual(set(ids), {""})
             else:
-                self.assertNotIn("chr21", chroms)
+                self.assertTrue(all(0 <= float(x) <= 1 for x in ids))
             ori = defaultdict(list)
             for r in rs:
                 ori[r["window_id"]].append(r["orientation"])
@@ -368,6 +430,15 @@ class TestPontaAPonta(unittest.TestCase):
         l1_strict = {r["window_id"] for r in linhas["test_strict"] if r["source"] == "l1"}
         self.assertTrue(l1_strict and l1_strict < l1_test)
         self.assertTrue(all(10000 <= int(w.split(":")[2].split("-")[0]) < 16000 for w in l1_test - l1_strict))
+        # max_id_train: a copia da familia (2% de mutacao) tem identidade alta com o train; o L1 unico, nao
+        ids = {r["window_id"]: float(r["max_id_train"]) for r in linhas["test"] if r["source"] == "l1"}
+        self.assertTrue(all(ids[w] >= 0.95 for w in l1_test - l1_strict))
+        self.assertTrue(all(ids[w] < 0.80 for w in l1_strict))
+        # dev: copia da familia fora do dev_strict, L1 unico dentro
+        l1_dev = {r["window_id"] for r in linhas["dev"] if r["source"] == "l1"}
+        l1_dev_strict = {r["window_id"] for r in linhas["dev_strict"] if r["source"] == "l1"}
+        self.assertTrue(l1_dev_strict and l1_dev_strict < l1_dev)
+        self.assertTrue(all(50000 <= int(w.split(":")[2].split("-")[0]) < 56000 for w in l1_dev_strict))
         # zona cinza: nada de negativo tocando o L1 antigo do rmsk
         for r in linhas["train"] + linhas["dev"]:
             if r["label"] == "0" and r["chrom"] == "chr22":
@@ -376,20 +447,28 @@ class TestPontaAPonta(unittest.TestCase):
 
         chk = dict(meta["checagens"])
         self.assertGreater(chk.pop("grupo_em_test_e_train_dev"), 0)  # esperado em filter-test
+        self.assertGreater(chk.pop("grupo_em_train_e_dev"), 0)        # esperado no modo chrom
         self.assertTrue(all(v == 0 for v in chk.values()), chk)
         self.assertIn("L1PA2", meta["vazamento"]["l1_test_fora_do_test_strict_por_subfamilia"])
         self.assertIn("easy-linclust", meta["mmseqs_comando"])
+        self.assertIn("easy-search", meta["max_id_train"]["comando"])
+        faixas = meta["max_id_train"]["faixas"]["test"]["max_id_train"]["l1"]
+        self.assertEqual(sum(faixas.values()), len(l1_test))
+        vs = meta["max_id_train"]["l1_vs_strict"]["test"]
+        self.assertEqual(vs["l1_test_strict"], len(l1_strict))
 
         saida = self.rodar(out1, "--only-if-changed")
         self.assertIn("nada a fazer", saida)
 
     def test_purge_train_e_pol(self):
         out = os.path.join(self.d, "purge")
-        self.rodar(out, "--leak-policy", "purge-train", "--retrovirus-mode", "pol")
+        self.rodar(out, "--leak-policy", "purge-train", "--retrovirus-mode", "pol", "--dev-mode", "hash")
         linhas = self.ler(out)
         self.assertEqual(linhas["test"], linhas["test_strict"])
+        self.assertEqual(linhas["dev"], linhas["dev_strict"])
         grupos = {n: {r["group"] for r in rs} for n, rs in linhas.items()}
         self.assertFalse(grupos["test"] & (grupos["train"] | grupos["dev"]))
+        self.assertFalse(grupos["train"] & grupos["dev"])
         retro = {r["detail"] for rs in linhas.values() for r in rs if r["source"] == "retrovirus"}
         self.assertLessEqual(retro, {"NC_000001.1"})
         import json

@@ -11,8 +11,8 @@ são copiados para o cluster depois.
 # testes (FASTA/TSV sintéticos; o ponta a ponta usa o MMseqs2 e é pulado sem ele)
 "$HOME/l1_data/venv/bin/python" -m unittest discover scripts/data_prep/l1/tests
 
-# dry run (chr21 + chr22, ~20 s), saída em $L1_DATASET_DIR/dryrun/
-bash scripts/data_prep/l1/run_local.sh --limit-chroms chr21,chr22
+# dry run (chr10 = dev, chr21 = test, chr22 = train; ~3 min), saída em $L1_DATASET_DIR/dryrun/
+bash scripts/data_prep/l1/run_local.sh --limit-chroms chr10,chr21,chr22
 
 # dataset completo: ident95 e depois ident98
 bash scripts/data_prep/l1/run_local.sh
@@ -38,11 +38,11 @@ Só chr1–22, chrX, chrY (contigs `_alt/_random/chrUn` e chrM ignorados).
 
 ## Saídas
 
-`$L1_DATASET_DIR/ident95/` e `ident98/`: `train.csv`, `dev.csv`, `test.csv`, `test_strict.csv` e
-`data_meta.json`. Colunas:
+`$L1_DATASET_DIR/ident95/` e `ident98/`: `train.csv`, `dev.csv`, `dev_strict.csv`, `test.csv`,
+`test_strict.csv` e `data_meta.json`. Colunas (iguais em todos os arquivos):
 
 ```
-sequence,label,source,detail,window_id,orientation,chrom,start,end,strand,group,gc
+sequence,label,source,detail,window_id,orientation,chrom,start,end,strand,group,gc,max_id_train,max_id_train_local
 ```
 
 - `source` ∈ l1, retrovirus, te, background, markov. `detail`: `SUBFAMÍLIA:REGIÕES;…` (l1),
@@ -51,12 +51,16 @@ sequence,label,source,detail,window_id,orientation,chrom,start,end,strand,group,
   reverso), sempre no mesmo arquivo. `strand` é a fita da anotação (`.` no background).
 - `chrom/start/end` 0-based half-open (BED); vazios em markov e retrovirus.
 - `gc` em fração (4 casas). Sequências em maiúsculas, só ACGT, exatamente 1.024 bp.
-- **`test_strict.csv` é a métrica principal**; `test.csv` é secundária (ver vazamento abaixo).
+- `max_id_train` / `max_id_train_local`: identidade máxima com qualquer janela do train (vazias no
+  train; `0.0000` sem hit). Ver "Identidade com o train".
+- **`test_strict.csv` é a métrica principal**; `test.csv` é secundária. Para seleção de modelo, o
+  análogo é `dev_strict.csv` (ver vazamento abaixo).
 
 `data_meta.json`: parâmetros, sha256 das entradas e dos CSVs, commit do git, versões (Python,
-pysam, numpy, MMseqs2), comando exato do MMseqs2, contagens por conjunto × source × label, GC médio
+pysam, numpy, MMseqs2), comandos exatos do MMseqs2 (clustering e busca), contagens por conjunto × source × label, GC médio
 por source e por conjunto, composição dos `te` por repFamily, descartes (zona cinza, N, IUPAC),
-déficits de amostragem e de balanço, relatório de vazamento e resultado das checagens.
+déficits de amostragem e de balanço, relatório de vazamento (l1 fora do `*_strict` por
+subfamília), faixas de `max_id_train*` e resultado das checagens.
 
 ## Definições
 
@@ -78,39 +82,64 @@ Retroposon). Candidato que toca L1 conta como zona cinza, nunca vira negativo.
 - `background` (30%): tiles sem sobreposição com nenhuma repetição intercalada do rmsk (todas as
   classes exceto `Simple_repeat` e `Low_complexity`).
 - `markov` (35%): cadeia de ordem `--markov-order` (pseudocontagem 1) treinada nas janelas `l1` dos
-  cromossomos fora do holdout, nas duas orientações.
-- `te`, `background` e `markov` são casados em GC (bins de 2 pontos) com o histograma do `l1`.
+  cromossomos de train (fora do holdout e, no modo chrom, fora dos dev-chroms), nas duas orientações.
+- `te`, `background` e `markov` são casados em GC (bins de 2 pontos) com o histograma do `l1` do
+  mesmo papel de cromossomo (train, dev, test).
 
 **Balanço**: negativos = positivos em cada conjunto, na proporção `--neg-mix`. Falta em `te` ou
 `markov` é completada com `background`; qualquer déficit restante vai para o log e o meta. O balanço
-do `test_strict` é recalculado dentro dele.
+de `dev_strict` e `test_strict` é recalculado dentro de cada um.
 
 **Split sem vazamento**
-1. `--holdout-chroms` (padrão chr8, chr21) → test.
+1. `--holdout-chroms` (padrão chr8, chr21) → test. `--dev-mode chrom` (padrão): `--dev-chroms`
+   (padrão chr7, chr10) → dev; precisam ser disjuntos do holdout (senão aborta).
 2. MMseqs2 `easy-linclust --dbtype 2 --min-seq-id 0.90 -c 0.8 --cov-mode 0` sobre todas as janelas nas
    duas orientações (cópias em fitas opostas só se parecem como complemento reverso).
 3. Union-find de cluster ∪ elemento L1 ∪ accession retroviral → `group`.
-4. Fora do holdout, o split é do grupo: train/dev por hash determinístico (`--dev-frac`, seed);
-   grupo só de retrovírus por `--retro-split` (0.8/0.1/0.1); grupo só de Markov pelas frações
-   estimadas dos positivos.
-5. `--leak-policy`:
-   - `filter-test` (padrão): train/dev intactos; `test.csv` = tudo do holdout; `test_strict.csv` = só
+4. Janela genômica: o split vem do cromossomo (holdout → test, dev-chrom → dev, resto → train). Com
+   `--dev-mode hash`, o dev sai dos grupos fora do holdout por hash determinístico (`--dev-frac`) e
+   train/dev nunca dividem grupo. Retrovírus e Markov seguem o grupo: com janela genômica de train →
+   train, senão de dev → dev; grupo só de retrovírus por `--retro-split` (0.8/0.1/0.1); só de Markov
+   pelas frações estimadas dos positivos.
+5. `dev_strict.csv` = janelas de dev cujo grupo não tem janela em train (no modo hash, == dev).
+6. `--leak-policy`:
+   - `filter-test` (padrão): train intacto; `test.csv` = tudo do holdout; `test_strict.csv` = só
      janelas de test cujo grupo não tem nenhuma janela em train/dev.
    - `purge-train`: janelas fora do holdout em grupos que tocam o test são removidas; `test_strict` ==
-     `test`.
+     `test`. O dev não é afetado.
 
-Checagens que abortam antes de gravar: holdout só em test; train e dev nunca dividem `group`;
-`test_strict` nunca divide `group` com train/dev; par fwd/rc nunca separado; sequência inválida.
-Em `filter-test`, test dividir grupo com train é esperado e só reportado
-(`checagens.grupo_em_test_e_train_dev`).
+Checagens que abortam antes de gravar: janela do train em nenhum outro arquivo; holdout só em test*,
+dev-chroms só em dev*; `dev_strict` nunca divide `group` com train; `test_strict` nunca divide `group`
+com train/dev; par fwd/rc nunca separado (a mesma janela só pode estar em {dev, dev_strict} ou
+{test, test_strict}); sequência inválida; no modo hash, train e dev nunca dividem `group`. Em
+`filter-test`, test e dev dividirem grupo com train é esperado e só reportado
+(`checagens.grupo_em_test_e_train_dev`, `grupo_em_train_e_dev`).
+
+**Identidade com o train**: uma execução de `easy-search --search-type 3 --strand 2 --min-seq-id 0.5
+-c 0.19 --cov-mode 0` (0.19 ≈ 200 bp de 1.024, o mínimo de L1 de um positivo) de todas as janelas de
+dev/test contra as do train. Do mesmo resultado:
+- `max_id_train` = maior identidade entre hits com `qcov >= 0.8`, comparável ao critério do clustering
+  e, portanto, ao `*_strict`;
+- `max_id_train_local` = maior identidade entre alinhamentos ≥ 200 bp. Pega o caso de uma janela com
+  só ~200 bp de L1 idêntico ao treino e flanco único.
+
+O meta traz as faixas (`<0.80`, `0.80-0.90`, `0.90-0.95`, `>=0.95`) por conjunto × source para as
+duas métricas, quantas janelas `l1` de test/dev têm `max_id_train < 0.90` (comparar com o `l1` do
+`*_strict`) e quantas têm `max_id_train < 0.90` mas `max_id_train_local >= 0.95` (vazamento
+escondido pela cobertura).
 
 **Atenção — vazamento de L1 jovem**: L1HS/L1PA são quase idênticos entre cromossomos; a união
-transitiva cria um grupo gigante. No dry run chr21/chr22 (ident95), o maior grupo reúne 72% do `l1`
-e 66% do `l1` de test cai fora do `test_strict` (L1PA2 77%). Veja
-`vazamento.l1_test_fora_do_test_strict_por_subfamilia` no meta.
+transitiva cria um grupo gigante. No run completo, o maior grupo reúne 81% do `l1` (ident95) e 79%
+(ident98); cerca de 81% do `l1` de test e de dev cai fora do `*_strict`. Mesmo no `test_strict`,
+quase todo `l1` tem `max_id_train_local >= 0.95` (854 de 1.037 no ident95, 300 de 301 no ident98):
+os grupos separam janelas inteiras, mas trechos ≥ 200 bp quase idênticos ao train continuam lá.
+Veja `vazamento.*_por_subfamilia` e `max_id_train` no meta.
 
 ## Determinismo e recursos
 
 - Mesma seed → CSVs idênticos (sha256), conferido no dry run e no teste ponta a ponta. Toda etapa
   aleatória usa uma seed derivada de `--seed` + nome da etapa.
+- O `easy-linclust` roda sempre com 1 thread: com várias threads, a pertença de algumas janelas aos
+  clusters variou entre runs (mesmo número de grupos, membros diferentes). `--threads` vale só para o
+  `easy-search`, que foi conferido como determinístico com 12 threads.
 - Um cromossomo por vez em memória; temporários do MMseqs2 em `$PREP_TMP_DIR`, apagados ao fim.
