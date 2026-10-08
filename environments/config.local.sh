@@ -32,6 +32,15 @@ RETRO_CDS_FA="${RETRO_CDS_FA:-$WORK_DIR/retrovirus/retrovirus-refseq-cds.fasta}"
 L1_DATASET_DIR="${L1_DATASET_DIR:-$WORK_DIR/l1_dataset}"
 PREP_TMP_DIR="${PREP_TMP_DIR:-$WORK_DIR/tmp}"
 
+# Baseline L1 no Mac (scripts/train/l1/run_local_probe.sh): venv de ML SEPARADO do
+# venv do data_prep (environments/create_mac_ml_env.sh), interpretador por caminho absoluto.
+ML_VENV="${ML_VENV:-$WORK_DIR/venv-ml}"
+ML_PYTHON="${ML_PYTHON:-$ML_VENV/bin/python}"
+HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+L1_EMB_DIR="${L1_EMB_DIR:-$WORK_DIR/embeddings}"
+L1_PROBE_DIR="${L1_PROBE_DIR:-$WORK_DIR/results/l1_probe}"
+
 export WORK_DIR PREP_PYTHON MMSEQS_BIN
 export HG38_FA RMSK_TXT L1FARM_TSV RETRO_GENOMES_FA RETRO_CDS_FA
 export L1_DATASET_DIR PREP_TMP_DIR
+export ML_VENV ML_PYTHON HF_HOME L1_EMB_DIR L1_PROBE_DIR

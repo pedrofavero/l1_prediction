@@ -14,18 +14,25 @@ modelo, revision, adaptador e sha256 do CSV, e com o .npy intacto, e pulado.
 Adaptadores (familia de modelo) em ADAPTADORES; cada um define tokenizacao,
 forward e pooling (`carregar()` e `embed(seqs) -> float32 [n, dim]`):
   nt2   Nucleotide Transformer v2 (AutoModelForMaskedLM, hidden_states[-1],
-        media sobre tokens validos, bf16 em GPU)
+        media sobre tokens validos)
   fake  contagem de 3-mers (64 dims), sem torch nem GPU: so para os testes
+
+Device: --device auto|cuda|mps|cpu (auto = cuda > mps > cpu; pedido indisponivel
+aborta). dtype: --dtype auto|bfloat16|float32 (auto = bf16 com autocast em cuda, e
+em mps se suportado; float32 em cpu; fp16 nunca, por risco de overflow). Antes de
+extrair, PARIDADE: 64 linhas do dev pelo device/dtype escolhido e pela CPU em
+float32; aborta se o cosseno minimo for < 0,999.
 Para um modelo novo (nt3, dnabert2, evo2): subclasse de Adaptador + entrada em
 ADAPTADORES; o resto do pipeline nao muda.
 
 Requer PYTHONPATH="$REPO_ROOT/scripts" (lib.l1_dados); o .sbatch exporta.
 Uso: extract_embeddings.py --model-tag nt2_50m --family nt2 --model-id ID --revision SHA
                            --ident ident98 [--data-dir D] [--out-dir D] [--splits ...]
-                           [--batch 64] [--weights-note TXT]
+                           [--device auto] [--dtype auto] [--batch N] [--weights-note TXT]
      extract_embeddings.py --verify-only --data-dir D
 """
 import argparse
+import contextlib
 import csv
 import json
 import os
@@ -44,6 +51,72 @@ except ModuleNotFoundError as e:
 
 MAX_LEN_TOKENS = 2048  # contexto maximo do NT v2
 LOTES_DETALHADOS = 3   # lotes iniciais com VRAM e throughput no log
+DEVICES = ("auto", "cuda", "mps", "cpu")
+DTYPES = ("auto", "bfloat16", "float32")
+BATCH_PADRAO = {"cuda": 64, "mps": 32, "cpu": 16}  # mps conservador para 18 GB de memoria unificada
+PARIDADE_N = 64
+PARIDADE_MIN = 0.999
+
+
+def resolver_device(pedido, cuda_ok, mps_ok):
+    """auto -> cuda > mps > cpu. Device pedido explicitamente e indisponivel -> RuntimeError."""
+    if pedido == "auto":
+        return "cuda" if cuda_ok else "mps" if mps_ok else "cpu"
+    if pedido == "cuda" and not cuda_ok:
+        raise RuntimeError("--device cuda, mas torch.cuda.is_available() == False: nenhuma GPU visivel. Na "
+                           "particao shared o recurso e --gres=mps:<pct>, NAO --gres=gpu:")
+    if pedido == "mps" and not mps_ok:
+        raise RuntimeError("--device mps, mas torch.backends.mps.is_available() == False")
+    return pedido
+
+
+def resolver_dtype(pedido, device, bf16_ok):
+    """auto -> bfloat16 em cuda/mps se suportado, senao float32; float32 em cpu. Nunca float16."""
+    if pedido == "float32":
+        return "float32"
+    if pedido == "bfloat16":
+        if not bf16_ok:
+            raise RuntimeError(f"--dtype bfloat16, mas bf16 nao e suportado em {device}")
+        return "bfloat16"
+    return "bfloat16" if device != "cpu" and bf16_ok else "float32"
+
+
+def cosseno(a, b):
+    """Cosseno linha a linha entre duas matrizes -> (minimo, media)."""
+    import numpy as np
+
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    den = np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1)
+    cos = np.divide((a * b).sum(1), den, out=np.zeros(len(a)), where=den > 0)
+    return float(cos.min()), float(cos.mean())
+
+
+def preparar_torch(pedido_device, pedido_dtype):
+    """Importa torch (com o fallback do MPS ligado antes) e resolve device/dtype -> (device, dtype, info)."""
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    import torch
+
+    mps_ok = bool(getattr(torch.backends, "mps", None) and torch.backends.mps.is_available())
+    device = resolver_device(pedido_device, torch.cuda.is_available(), mps_ok)
+    if device == "cuda":
+        bf16_ok = torch.cuda.is_bf16_supported()
+        chip = torch.cuda.get_device_name(0)
+    elif device == "mps":
+        try:
+            a = torch.randn(8, 8, device="mps")
+            with torch.autocast("mps", dtype=torch.bfloat16):
+                bf16_ok = (a @ a).dtype == torch.bfloat16
+        except Exception:  # noqa: BLE001 (autocast/bf16 no MPS varia com a versao do torch e do macOS)
+            bf16_ok = False
+        r = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True)
+        chip = r.stdout.strip() or platform.machine()
+    else:
+        bf16_ok = False
+        chip = platform.processor() or platform.machine()
+    dtype = resolver_dtype(pedido_dtype, device, bf16_ok)
+    return device, dtype, {"device": device, "dtype_forward": dtype + (" (autocast)" if dtype == "bfloat16" else ""),
+                           "bf16_suportado": bf16_ok, "chip": chip, "torch": torch.__version__,
+                           "mps_fallback": os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") if device == "mps" else None}
 
 
 def log(msg):
@@ -57,9 +130,11 @@ class Adaptador:
     versao = 1       # incrementar quando tokenizacao/forward/pooling mudar (invalida o reaproveitamento)
     camada = None
     pooling = None
+    usa_torch = True
 
-    def __init__(self, model_id, revision):
+    def __init__(self, model_id, revision, device="cpu", dtype="float32"):
         self.model_id, self.revision = model_id, revision
+        self.device, self.dtype = device, dtype
         self.dim = None
 
     def carregar(self):
@@ -86,25 +161,25 @@ class AdaptadorNT2(Adaptador):
         import transformers
         from transformers import AutoModelForMaskedLM, AutoTokenizer
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("torch.cuda.is_available() == False: nenhuma GPU visivel. Na particao shared o "
-                               "recurso e --gres=mps:<pct>, NAO --gres=gpu:")
         self.torch = torch
-        self.dev = torch.device("cuda:0")
+        self.dev = torch.device("cuda:0" if self.device == "cuda" else self.device)
         self.tok = AutoTokenizer.from_pretrained(self.model_id, revision=self.revision, trust_remote_code=True)
         self.model = AutoModelForMaskedLM.from_pretrained(self.model_id, revision=self.revision,
                                                           trust_remote_code=True).to(self.dev).eval()
         ids = [getattr(self.tok, f"{n}_token_id", None) for n in ("cls", "eos", "bos", "pad", "mask")]
         self.especiais = torch.tensor(sorted({i for i in ids if i is not None}), device=self.dev)
         self.dim = int(self.model.config.hidden_size)
-        props = torch.cuda.get_device_properties(0)
-        torch.cuda.reset_peak_memory_stats()
         self._tokens = None
-        return {"dispositivo": "cuda", "gpu": props.name, "vram_total_gb": round(props.total_memory / 2**30, 1),
-                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-                "dtype_forward": "bfloat16 (autocast)", "tokens_especiais_excluidos": self.especiais.tolist(),
+        self._mem_max = 0
+        info = {"tokens_especiais_excluidos": self.especiais.tolist(),
                 "n_parametros": sum(p.numel() for p in self.model.parameters()),
                 "versoes": {"torch": torch.__version__, "transformers": transformers.__version__}}
+        if self.device == "cuda":
+            props = torch.cuda.get_device_properties(0)
+            torch.cuda.reset_peak_memory_stats()
+            info.update(gpu=props.name, vram_total_gb=round(props.total_memory / 2**30, 1),
+                        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"))
+        return info
 
     def embed(self, seqs):
         torch = self.torch
@@ -112,7 +187,9 @@ class AdaptadorNT2(Adaptador):
                        return_tensors="pt")
         ids = enc["input_ids"].to(self.dev)
         mask = enc["attention_mask"].to(self.dev)
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        amp = (torch.autocast(self.device, dtype=torch.bfloat16) if self.dtype == "bfloat16"
+               else contextlib.nullcontext())
+        with torch.no_grad(), amp:
             out = self.model(input_ids=ids, attention_mask=mask, output_hidden_states=True)
         h = out.hidden_states[-1].float()
         valido = (mask.bool() & ~torch.isin(ids, self.especiais)).unsqueeze(-1).float()
@@ -123,10 +200,18 @@ class AdaptadorNT2(Adaptador):
         if not torch.isfinite(emb).all():
             raise RuntimeError("embedding nao finito (NaN/inf) no forward")
         self._tokens = (int(mask.sum(1).min()), int(mask.sum(1).max()), int(n.min()), int(n.max()))
-        return emb.cpu().numpy()
+        emb = emb.cpu().numpy()
+        if self.device == "mps":  # o MPS nao tem contador de pico: maximo amostrado apos cada lote
+            self._mem_max = max(self._mem_max, torch.mps.driver_allocated_memory())
+        return emb
 
     def vram_pico_gb(self):
-        return round(self.torch.cuda.max_memory_allocated() / 2**30, 2)
+        """Pico de VRAM (cuda) ou maximo amostrado da memoria do driver (mps); None na cpu."""
+        if self.device == "cuda":
+            return round(self.torch.cuda.max_memory_allocated() / 2**30, 2)
+        if self.device == "mps":
+            return round(self._mem_max / 2**30, 2)
+        return None
 
     def info_lote(self):
         if self._tokens is None:
@@ -141,6 +226,7 @@ class AdaptadorFalso(Adaptador):
     familia = "fake"
     camada = "-"
     pooling = "contagem de 3-mers / numero de 3-mers"
+    usa_torch = False
 
     def carregar(self):
         import numpy as np
@@ -186,9 +272,41 @@ def gravar_json(path, obj):
     os.replace(tmp, path)
 
 
-def chave_modelo(args, adaptador_cls):
+def chave_modelo(args, adaptador_cls, device, dtype):
+    """Reaproveitamento so com a mesma chave: embeddings de devices/dtypes diferentes nao se misturam."""
     return {"model_tag": args.model_tag, "familia": args.family, "model_id": args.model_id,
-            "revision": args.revision, "versao_adaptador": adaptador_cls.versao, "dtype_saida": "float16"}
+            "revision": args.revision, "versao_adaptador": adaptador_cls.versao, "device": device,
+            "dtype_forward": dtype, "dtype_saida": "float16"}
+
+
+def embed_em_lotes(adaptador, seqs, batch):
+    import numpy as np
+
+    return np.concatenate([adaptador.embed(seqs[i:i + batch]) for i in range(0, len(seqs), batch)])
+
+
+def checar_paridade(cls, args, adaptador, data_dir, batch):
+    """PARIDADE_N linhas do dev (espacadas no CSV) no device/dtype escolhido vs CPU float32 -> resultado.
+
+    Nao aplicavel quando o proprio device ja e a referencia (cpu/float32) ou o adaptador nao usa torch.
+    """
+    if not cls.usa_torch or (adaptador.device == "cpu" and adaptador.dtype == "float32"):
+        return {"aplicavel": False, "motivo": "device ja e a referencia (cpu float32) ou adaptador sem torch"}
+    import numpy as np
+
+    seqs_dev = ler_csv_l1(os.path.join(data_dir, "dev.csv"), com_sequencia=True)["sequence"]
+    idx = sorted(set(np.linspace(0, len(seqs_dev) - 1, PARIDADE_N).round().astype(int).tolist()))
+    seqs = [seqs_dev[i] for i in idx]
+    a = embed_em_lotes(adaptador, seqs, batch)
+    ref = cls(args.model_id, args.revision, "cpu", "float32")
+    ref.carregar()
+    b = embed_em_lotes(ref, seqs, BATCH_PADRAO["cpu"])
+    del ref
+    cmin, cmed = cosseno(a, b)
+    return {"aplicavel": True, "n": len(seqs), "linhas_do_dev": "espacadas uniformemente no CSV",
+            "referencia": "cpu float32", "device": adaptador.device, "dtype": adaptador.dtype,
+            "cos_min": round(cmin, 6), "cos_media": round(cmed, 6), "limite": PARIDADE_MIN,
+            "aprovado": cmin >= PARIDADE_MIN}
 
 
 def reaproveitavel(out_dir, split, entrada, sha_csv):
@@ -254,7 +372,10 @@ def main(argv=None):
     ap.add_argument("--data-dir", help="padrao: $L1_DATASET_DIR/<ident>")
     ap.add_argument("--out-dir", help="padrao: $L1_EMB_DIR/<model_tag>/<ident>")
     ap.add_argument("--splits", nargs="+", default=list(CONJUNTOS), choices=CONJUNTOS)
-    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--device", choices=DEVICES, default="auto", help="auto = cuda > mps > cpu")
+    ap.add_argument("--dtype", choices=DTYPES, default="auto",
+                    help="auto = bfloat16 (autocast) em cuda/mps se suportado, float32 em cpu; nunca float16")
+    ap.add_argument("--batch", type=int, help=f"padrao por device: {BATCH_PADRAO}")
     ap.add_argument("--weights-note", default="", help="origem dos pesos, gravada no meta.json")
     ap.add_argument("--verify-only", action="store_true", help="so confere os sha256 dos CSVs e sai")
     args = ap.parse_args(argv)
@@ -278,7 +399,16 @@ def main(argv=None):
         sys.exit("ERRO: passe --out-dir ou defina L1_EMB_DIR (environments/config.sh)")
     os.makedirs(out_dir, exist_ok=True)
     cls = ADAPTADORES[args.family]
-    chave = chave_modelo(args, cls)
+    if cls.usa_torch:
+        try:
+            device, dtype, info_device = preparar_torch(args.device, args.dtype)
+        except RuntimeError as e:
+            sys.exit(f"ERRO: {e}")
+    else:
+        device, dtype, info_device = "cpu", "float32", {"device": "cpu", "dtype_forward": "float32"}
+    batch = args.batch or BATCH_PADRAO[device]
+    log(f"device {device}, dtype {dtype}, batch {batch} ({info_device})")
+    chave = chave_modelo(args, cls, device, dtype)
     meta_path = os.path.join(out_dir, "meta.json")
     try:
         with open(meta_path) as f:
@@ -294,25 +424,30 @@ def main(argv=None):
     import numpy
 
     meta = {"chave": chave, **chave, "origem_pesos": args.weights_note or None, "ident": args.ident,
-            "data_dir": data_dir, "camada": cls.camada, "pooling": cls.pooling, "batch": args.batch,
+            "data_dir": data_dir, "camada": cls.camada, "pooling": cls.pooling, "batch": batch,
             "git": git_commit(), "hostname": platform.node(), "slurm_job_id": env("SLURM_JOB_ID"),
             "versoes": {"python": platform.python_version(), "numpy": numpy.__version__},
             "splits": {s: e for s, e in splits_antigos.items() if s in args.splits and s not in pendentes}}
     if pendentes:
-        adaptador = cls(args.model_id, args.revision)
+        adaptador = cls(args.model_id, args.revision, device, dtype)
         t0 = time.time()
-        info = adaptador.carregar()
+        info = {**info_device, **adaptador.carregar()}
         log(f"modelo {args.model_id}@{args.revision[:12]} ({args.family}) carregado em {time.time() - t0:.1f} s; "
             f"dim {adaptador.dim}; {info}")
-        meta.update(dim=adaptador.dim, ambiente=info)
+        paridade = checar_paridade(cls, args, adaptador, data_dir, batch)
+        log(f"paridade: {paridade}")
+        if paridade.get("aplicavel") and not paridade["aprovado"]:
+            sys.exit(f"ERRO de PARIDADE: cosseno minimo {paridade['cos_min']} < {PARIDADE_MIN} entre {device}/{dtype} "
+                     "e cpu/float32; nada foi extraido. Tente --dtype float32.")
+        meta.update(dim=adaptador.dim, ambiente=info, paridade=paridade)
         for s in pendentes:
             log(f"{s}: extraindo")
-            entrada = extrair_split(adaptador, os.path.join(data_dir, f"{s}.csv"), out_dir, s, args.batch)
+            entrada = extrair_split(adaptador, os.path.join(data_dir, f"{s}.csv"), out_dir, s, batch)
             entrada["sha256_csv"] = hashes[s]
             meta["splits"][s] = entrada
             gravar_json(meta_path, meta)  # grava a cada split: um timeout nao perde o que ja foi feito
     else:
-        meta.update(dim=antigo.get("dim"), ambiente=antigo.get("ambiente"))
+        meta.update(dim=antigo.get("dim"), ambiente=antigo.get("ambiente"), paridade=antigo.get("paridade"))
     meta["gerado_em"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     gravar_json(meta_path, meta)
     log(f"embeddings em {out_dir}: " + ", ".join(f"{s} {meta['splits'][s]['n']}" for s in args.splits))

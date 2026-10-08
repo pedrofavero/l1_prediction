@@ -24,20 +24,8 @@ TAG="$1"
 IDENT="$2"
 shift 2
 
-case "$TAG" in
-    nt2_50m)
-        FAMILY=nt2; MODEL_ID="$NT2_MODEL_ID"; REVISION="$NT2_MODEL_REVISION"; TEMPO=01:00:00
-        NOTA="repositorio HF no revision pinado (model.safetensors do main)" ;;
-    nt2_250m)
-        FAMILY=nt2; MODEL_ID="$NT2_250M_ID"; REVISION="$NT2_250M_REVISION"; TEMPO=02:00:00
-        NOTA="model.safetensors da conversao automatica do HF (SFconvertbot, refs/pr/3); demais arquivos identicos ao main c0f0359" ;;
-    nt2_500m)
-        FAMILY=nt2; MODEL_ID="$NT2_500M_ID"; REVISION="$NT2_500M_REVISION"; TEMPO=03:00:00
-        NOTA="repositorio HF no revision pinado (model.safetensors do main)" ;;
-    *)
-        echo "ERRO: model_tag '$TAG' desconhecido (nt2_50m, nt2_250m, nt2_500m)" >&2
-        exit 1 ;;
-esac
+source "$REPO_ROOT/scripts/l1_model_tags.sh"
+resolver_model_tag "$TAG" || exit 1
 case "$IDENT" in
     ident95|ident98) ;;
     *) echo "ERRO: ident '$IDENT' desconhecido (ident95, ident98)" >&2; exit 1 ;;

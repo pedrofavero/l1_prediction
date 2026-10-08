@@ -12,6 +12,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 import numpy as np
@@ -30,6 +31,10 @@ def carregar_modulo(nome, path):
 
 M = carregar_modulo("metrics", os.path.join(L1_DIR, "metrics.py"))
 D = carregar_modulo("l1_dados", os.path.join(SCRIPTS, "lib", "l1_dados.py"))
+# extract_embeddings faz `from lib.l1_dados import ...`: registra o modulo ja carregado, sem mexer no sys.path
+sys.modules.setdefault("lib", types.ModuleType("lib"))
+sys.modules.setdefault("lib.l1_dados", D)
+E = carregar_modulo("extract_embeddings", os.path.join(L1_DIR, "extract_embeddings.py"))
 COLUNAS = ("sequence", "label", "source", "detail", "window_id", "orientation", "chrom", "start", "end",
            "strand", "group", "gc", "max_id_train", "max_id_train_local")
 CONJUNTOS = ("train", "dev", "dev_strict", "test", "test_strict")
@@ -134,6 +139,36 @@ def escrever_dataset(d, rng, n_janelas=None):
     return hashes
 
 
+class TestDevice(unittest.TestCase):
+    def test_resolver_device(self):
+        self.assertEqual(E.resolver_device("auto", True, True), "cuda")
+        self.assertEqual(E.resolver_device("auto", False, True), "mps")
+        self.assertEqual(E.resolver_device("auto", False, False), "cpu")
+        self.assertEqual(E.resolver_device("cpu", True, True), "cpu")
+        self.assertEqual(E.resolver_device("mps", False, True), "mps")
+        with self.assertRaises(RuntimeError):
+            E.resolver_device("cuda", False, True)   # servidor sem GPU visivel: aborta, nao cai para cpu
+        with self.assertRaises(RuntimeError):
+            E.resolver_device("mps", False, False)
+
+    def test_resolver_dtype(self):
+        self.assertEqual(E.resolver_dtype("auto", "mps", True), "bfloat16")
+        self.assertEqual(E.resolver_dtype("auto", "mps", False), "float32")
+        self.assertEqual(E.resolver_dtype("auto", "cpu", True), "float32")
+        self.assertEqual(E.resolver_dtype("auto", "cuda", True), "bfloat16")
+        self.assertEqual(E.resolver_dtype("float32", "cuda", True), "float32")
+        with self.assertRaises(RuntimeError):
+            E.resolver_dtype("bfloat16", "mps", False)
+        self.assertNotIn("float16", E.DTYPES)
+
+    def test_cosseno(self):
+        rng = np.random.default_rng(0)
+        a = rng.normal(size=(64, 512))
+        self.assertAlmostEqual(E.cosseno(a, a)[0], 1.0)
+        self.assertGreaterEqual(E.cosseno(a, a + rng.normal(scale=1e-3, size=a.shape))[0], E.PARIDADE_MIN)
+        self.assertLess(E.cosseno(a, a + rng.normal(scale=0.1, size=a.shape))[0], E.PARIDADE_MIN)
+
+
 class TestIntegridade(unittest.TestCase):
     def test_hash_certo_passa_errado_aborta(self):
         with tempfile.TemporaryDirectory() as d:
@@ -191,6 +226,8 @@ class TestPontaAPonta(unittest.TestCase):
         with open(os.path.join(self.emb, "meta.json")) as f:
             meta = json.load(f)
         self.assertEqual(meta["origem_pesos"], "sintetico")
+        self.assertEqual((meta["device"], meta["dtype_forward"]), ("cpu", "float32"))
+        self.assertFalse(meta["paridade"]["aplicavel"])
         for s in CONJUNTOS:
             X = np.load(os.path.join(self.emb, f"{s}.npy"))
             self.assertEqual(X.dtype, np.float16)

@@ -69,7 +69,7 @@ nvidia-smi || echo "AVISO: nvidia-smi indisponivel neste no"
 
 echo "== 2/3 extracao -> $EMB_DIR"
 "$NT2_PYTHON" "$TRAIN_DIR/extract_embeddings.py" --model-tag "$L1_MODEL_TAG" --family "$L1_MODEL_FAMILY" \
-    --model-id "$L1_MODEL_ID" --revision "$L1_MODEL_REVISION" --ident "$L1_IDENT" \
+    --model-id "$L1_MODEL_ID" --revision "$L1_MODEL_REVISION" --ident "$L1_IDENT" --device cuda \
     --data-dir "$DATA_DIR" --out-dir "$EMB_DIR" --weights-note "${L1_MODEL_WEIGHTS_NOTE:-}"
 
 echo "== 3/3 probe -> $L1_PROBE_DIR/$L1_MODEL_TAG/$L1_IDENT"
